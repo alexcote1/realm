@@ -3,6 +3,8 @@
 use crate::Transport;
 use anyhow::{anyhow, Result};
 use pb::c2::*;
+use tokio::runtime::Handle;
+use tokio::sync::oneshot::channel;
 use std::sync::mpsc::{self, Receiver, Sender};
 use tonic::codec::ProstCodec;
 use tonic::GrpcMethod;
@@ -93,14 +95,12 @@ impl Transport for GRPC {
                     .map_err(|e| anyhow!("Invalid endpoint URI: {}", e))?;
 
                 let channel = endpoint
-                    .connect_with_connector(service_fn(|_: Uri| async {
+                    .connect_with_connector_lazy(service_fn(|_: Uri| async {
                         let path = "/tmp/.sshtty"; // Replace with the actual UDS path
                         UnixStream::connect(path)
                             .await
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                    }))
-                    .await
-                    .map_err(|e| anyhow!("Failed to connect to gRPC server: {}", e))?;
+                    }));
 
                 Ok(tonic::client::Grpc::new(channel))
             });
@@ -108,19 +108,19 @@ impl Transport for GRPC {
             sender
                 .send(connection)
                 .expect("Failed to send gRPC connection result");
-
+            
             // Keep the runtime alive
             rt.block_on(async {
-                sleep(Duration::from_secs(20)).await;            });
-        });
+                sleep(Duration::from_secs(20)).await; 
+                           });
+        }); 
 
         let grpc = receiver
             .recv()
             .map_err(|e| anyhow!("Failed to receive gRPC connection result: {e}"))??;
 
-        // Optionally, detach the thread if you don't need to join it later
-
-
+            
+        
         Ok(Self { grpc })
     }
 
